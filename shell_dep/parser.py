@@ -1,8 +1,23 @@
+"""Orchestration layer: coordinates detection, extraction, and resolution.
+
+Single responsibility of THIS module:
+  - define the public data classes (SourceStatement, ShellScript)
+  - resolve raw source paths against the filesystem (PathResolver)
+  - parse a single file / scan a directory by delegating to the
+    detection, extraction, and lexing layers.
+
+Lower layers know nothing about the filesystem or about ShellScript:
+  - detector.py  -> "is this a shell script?"
+  - lexer.py     -> "tokenize this text"
+  - extractor.py -> "which source/. commands are here?"
+"""
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
+
+from .detector import ScriptDetector
+from .extractor import SourceExtractor, RawSource
 
 
 @dataclass
@@ -23,107 +38,71 @@ class ShellScript:
         return self.path.name
 
 
-SOURCE_PATTERNS = [
-    re.compile(r'^\s*source\s+(.+?)\s*$'),
-    re.compile(r'^\s*\.\s+(.+?)\s*$'),
-]
+class PathResolver:
+    """Resolves a raw source path relative to the importing script."""
 
-DYNAMIC_PATH_PATTERN = re.compile(r'(\$|\{)')
-
-
-def is_shell_script(file_path: Path) -> bool:
-    if file_path.suffix.lower() in ('.sh', '.bash'):
-        return True
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            first_line = f.readline()
-            if first_line.startswith('#!') and ('bash' in first_line or 'sh' in first_line):
-                return True
-    except (OSError, IOError):
-        pass
-    return False
+    @staticmethod
+    def resolve(source_file: Path, raw_path: str) -> Optional[Path]:
+        source_path = Path(raw_path)
+        if source_path.is_absolute():
+            candidate = source_path
+        else:
+            candidate = source_file.parent / source_path
+        candidate = candidate.resolve()
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        return None
 
 
-def strip_shell_comments(line: str) -> str:
-    in_single_quote = False
-    in_double_quote = False
-    for i, char in enumerate(line):
-        if char == "'" and not in_double_quote:
-            in_single_quote = not in_single_quote
-        elif char == '"' and not in_single_quote:
-            in_double_quote = not in_double_quote
-        elif char == '#' and not in_single_quote and not in_double_quote:
-            if i == 0 or (i > 0 and line[i - 1].isspace()):
-                return line[:i].rstrip()
-    return line
+class ShellScriptParser:
+    """Parses shell scripts into ShellScript objects."""
+
+    def __init__(self):
+        self._extractor = SourceExtractor()
+        self._detector = ScriptDetector()
+        self._resolver = PathResolver()
+
+    def parse(self, file_path: Path) -> ShellScript:
+        script = ShellScript(path=file_path.resolve())
+        text = self._read_text(file_path)
+        if text is None:
+            return script
+
+        for raw in self._extractor.extract(text):
+            resolved = None
+            if not raw.is_dynamic:
+                resolved = self._resolver.resolve(file_path, raw.raw_path)
+            script.sources.append(SourceStatement(
+                raw_path=raw.raw_path,
+                resolved_path=resolved,
+                line_number=raw.line_number,
+                is_dynamic=raw.is_dynamic,
+            ))
+        return script
+
+    @staticmethod
+    def _read_text(file_path: Path) -> Optional[str]:
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except (OSError, IOError):
+            return None
 
 
-def strip_quotes(path_str: str) -> str:
-    path_str = path_str.strip()
-    if len(path_str) >= 2:
-        if (path_str[0] == '"' and path_str[-1] == '"') or \
-           (path_str[0] == "'" and path_str[-1] == "'"):
-            return path_str[1:-1]
-    return path_str
-
-
-def parse_source_path(raw_match: str) -> Tuple[str, bool]:
-    parts = raw_match.split()
-    if not parts:
-        return '', False
-    path_str = strip_quotes(parts[0])
-    is_dynamic = bool(DYNAMIC_PATH_PATTERN.search(path_str))
-    return path_str, is_dynamic
-
-
-def resolve_source_path(source_file: Path, raw_path: str) -> Optional[Path]:
-    source_path = Path(raw_path)
-    if source_path.is_absolute():
-        candidate = source_path
-    else:
-        candidate = source_file.parent / source_path
-    candidate = candidate.resolve()
-    if candidate.exists() and candidate.is_file():
-        return candidate
-    return None
+_PARSER = ShellScriptParser()
 
 
 def parse_shell_script(file_path: Path) -> ShellScript:
-    script = ShellScript(path=file_path.resolve())
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-    except (OSError, IOError):
-        return script
-
-    for line_num, raw_line in enumerate(lines, start=1):
-        line = strip_shell_comments(raw_line)
-        if not line.strip():
-            continue
-        for pattern in SOURCE_PATTERNS:
-            match = pattern.match(line)
-            if match:
-                raw_match = match.group(1)
-                raw_path, is_dynamic = parse_source_path(raw_match)
-                if raw_path:
-                    resolved = None if is_dynamic else resolve_source_path(file_path, raw_path)
-                    script.sources.append(SourceStatement(
-                        raw_path=raw_path,
-                        resolved_path=resolved,
-                        line_number=line_num,
-                        is_dynamic=is_dynamic,
-                    ))
-                break
-    return script
+    return _PARSER.parse(file_path)
 
 
 def scan_directory(directory: Path) -> Dict[Path, ShellScript]:
     scripts: Dict[Path, ShellScript] = {}
-    for root, dirs, files in os.walk(directory):
+    for root, _dirs, files in os.walk(directory):
         root_path = Path(root)
         for filename in files:
             file_path = root_path / filename
-            if is_shell_script(file_path):
+            if ScriptDetector.is_shell_script(file_path):
                 script = parse_shell_script(file_path)
                 scripts[script.path] = script
     return scripts
