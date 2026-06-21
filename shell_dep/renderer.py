@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Set, List, Optional
+from typing import Set, List, Optional, Tuple
 
 from colorama import Fore, Style, init as colorama_init
 
@@ -71,52 +71,88 @@ def _format_edge_source_info(
     return f'{edge.source_stmt.raw_path} (line {line})'
 
 
-def _render_children(
-    parent: Path,
+def _path_key(path: Path) -> str:
+    return str(path.resolve())
+
+
+def _render_tree_iterative(
     graph: DependencyGraph,
     base_dir: Path,
-    prefix: str,
-    visited: Set[Path],
-    depth: int,
-    max_depth: int,
+    roots: List[Path],
 ) -> List[str]:
-    output_lines: List[str] = []
+    lines: List[str] = []
 
-    if parent not in graph.edges:
-        return output_lines
+    for root_idx, root in enumerate(roots):
+        is_last_root = (root_idx == len(roots) - 1)
 
-    edges = graph.edges[parent]
-    if not edges:
-        return output_lines
+        lines.append(_format_script_name(root, graph, base_dir))
 
-    for i, edge in enumerate(edges):
-        is_last_edge = (i == len(edges) - 1)
-        edge_connector = TREE_LAST_BRANCH if is_last_edge else TREE_BRANCH
-        edge_line_prefix = prefix + edge_connector
+        if root not in graph.edges or not graph.edges[root]:
+            if not is_last_root:
+                lines.append('')
+            continue
 
-        if edge.is_dynamic or edge.is_missing:
-            edge_label = _format_edge_source_info(edge, graph, base_dir)
-            output_lines.append(f'{edge_line_prefix}{edge_label}')
-        else:
-            target = edge.to_script
-            if target is None:
+        root_key = _path_key(root)
+        visited_global: Set[str] = {root_key}
+
+        root_edges = graph.edges[root]
+
+        stack: List[Tuple[Path, str, Set[str], List[DependencyEdge], int, bool]] = []
+
+        for i in range(len(root_edges) - 1, -1, -1):
+            is_last_edge = (i == len(root_edges) - 1)
+            stack.append((
+                root, '', {root_key}, root_edges, i, is_last_edge
+            ))
+
+        while stack:
+            parent, prefix, visited_path, edges, edge_idx, is_last_edge = stack.pop()
+
+            if edge_idx >= len(edges):
                 continue
-            already_visited = target in visited
-            edge_label = _format_edge_source_info(edge, graph, base_dir, already_visited=already_visited)
-            output_lines.append(f'{edge_line_prefix}{edge_label}')
-            if not already_visited and depth < max_depth:
-                child_prefix = prefix + (TREE_EMPTY if is_last_edge else TREE_VERTICAL)
-                child_visited = visited | {target}
-                sub_lines = _render_children(
-                    target, graph, base_dir,
-                    prefix=child_prefix,
-                    visited=child_visited,
-                    depth=depth + 1,
-                    max_depth=max_depth,
-                )
-                output_lines.extend(sub_lines)
 
-    return output_lines
+            edge = edges[edge_idx]
+
+            connector = TREE_LAST_BRANCH if is_last_edge else TREE_BRANCH
+            line_prefix = prefix + connector
+
+            if edge.is_dynamic or edge.is_missing:
+                edge_label = _format_edge_source_info(edge, graph, base_dir)
+                lines.append(f'{line_prefix}{edge_label}')
+            else:
+                target = edge.to_script
+                if target is None:
+                    continue
+
+                target_key = _path_key(target)
+                in_path = target_key in visited_path
+                in_global = target_key in visited_global
+                already_visited = in_path or in_global
+
+                edge_label = _format_edge_source_info(
+                    edge, graph, base_dir, already_visited=already_visited
+                )
+                lines.append(f'{line_prefix}{edge_label}')
+
+                if not already_visited:
+                    visited_global.add(target_key)
+                    new_visited_path = visited_path | {target_key}
+
+                    if target in graph.edges and graph.edges[target]:
+                        child_edges = graph.edges[target]
+                        child_prefix = prefix + (TREE_EMPTY if is_last_edge else TREE_VERTICAL)
+
+                        for i in range(len(child_edges) - 1, -1, -1):
+                            ce_last = (i == len(child_edges) - 1)
+                            stack.append((
+                                target, child_prefix, new_visited_path,
+                                child_edges, i, ce_last
+                            ))
+
+        if not is_last_root:
+            lines.append('')
+
+    return lines
 
 
 def render_tree(graph: DependencyGraph, base_dir: Optional[Path] = None) -> str:
@@ -128,8 +164,6 @@ def render_tree(graph: DependencyGraph, base_dir: Optional[Path] = None) -> str:
             base_dir = Path.cwd()
     base_dir = base_dir.resolve()
 
-    max_depth = 50
-
     lines: List[str] = []
     roots = sorted(graph.roots) if graph.roots else sorted(graph.scripts.keys())
 
@@ -140,21 +174,8 @@ def render_tree(graph: DependencyGraph, base_dir: Optional[Path] = None) -> str:
     lines.append(f'{Fore.LIGHTBLACK_EX}Base directory: {base_dir}{Style.RESET_ALL}')
     lines.append('')
 
-    for i, root in enumerate(roots):
-        is_last_root = (i == len(roots) - 1)
-        lines.append(_format_script_name(root, graph, base_dir))
-        visited: Set[Path] = {root}
-        child_prefix = '' if is_last_root else ''
-        subtree = _render_children(
-            root, graph, base_dir,
-            prefix=child_prefix,
-            visited=visited,
-            depth=0,
-            max_depth=max_depth,
-        )
-        lines.extend(subtree)
-        if not is_last_root:
-            lines.append('')
+    tree_lines = _render_tree_iterative(graph, base_dir, roots)
+    lines.extend(tree_lines)
 
     return '\n'.join(lines)
 
