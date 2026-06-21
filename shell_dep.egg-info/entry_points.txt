@@ -1,0 +1,2 @@
+[console_scripts]
+shell-dep = shell_dep.cli:main

@@ -1,0 +1,12 @@
+setup.py
+shell_dep/__init__.py
+shell_dep/cli.py
+shell_dep/graph.py
+shell_dep/parser.py
+shell_dep/renderer.py
+shell_dep.egg-info/PKG-INFO
+shell_dep.egg-info/SOURCES.txt
+shell_dep.egg-info/dependency_links.txt
+shell_dep.egg-info/entry_points.txt
+shell_dep.egg-info/requires.txt
+shell_dep.egg-info/top_level.txt
